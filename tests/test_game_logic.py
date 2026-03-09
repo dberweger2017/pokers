@@ -92,3 +92,23 @@ def test_illegal_actions():
 
     high_bet_state = state.apply_action(pkrs.Action(pkrs.ActionEnum.Raise, amount=101))
     assert high_bet_state.status == pkrs.StateStatus.HighBet
+
+
+def test_forced_checkdown_runs_out_to_showdown():
+    state = pkrs.State.from_seed(
+        n_players=3, button=0, sb=1.0, bb=2.0, stake=4.0, seed=0
+    )
+
+    state = state.apply_action(pkrs.Action(pkrs.ActionEnum.Raise, amount=2.0))
+    assert not state.final_state
+
+    state = state.apply_action(pkrs.Action(pkrs.ActionEnum.Call))
+    assert not state.final_state
+
+    state = state.apply_action(pkrs.Action(pkrs.ActionEnum.Call))
+
+    assert state.final_state
+    assert state.stage == pkrs.Stage.Showdown
+    assert state.status == pkrs.StateStatus.Ok
+    assert state.legal_actions == []
+    assert abs(sum(ps.reward for ps in state.players_state)) < 1e-9

@@ -19,6 +19,8 @@ macro_rules! verbose_println {
     };
 }
 
+const CHIP_EPSILON: f64 = 1e-9;
+
 pub struct InitStateError {
     msg: String,
 }
@@ -230,6 +232,7 @@ impl State {
 
         if round_ended {
             new_state.to_next_stage();
+            runout_forced_checkdown(&mut new_state);
         }
 
         // The game ends if the players have reached the showdown or every player except one has folded
@@ -351,6 +354,10 @@ fn legal_actions(state: &State) -> Vec<ActionEnum> {
         illegal_actions.append(&mut ActionEnum::iter().collect());
     }
 
+    if is_forced_checkdown(state) {
+        return vec![ActionEnum::Check];
+    }
+
     if state.min_bet == 0.0 {
         illegal_actions.push(ActionEnum::Call);
     }
@@ -363,6 +370,37 @@ fn legal_actions(state: &State) -> Vec<ActionEnum> {
         .filter(|a| !illegal_actions.contains(a))
         .collect();
     legal_actions
+}
+
+fn is_forced_checkdown(state: &State) -> bool {
+    let active_players: Vec<PlayerState> = state
+        .players_state
+        .iter()
+        .copied()
+        .filter(|ps| ps.active)
+        .collect();
+
+    if active_players.len() < 2 {
+        return false;
+    }
+
+    let current_player = state.players_state[state.current_player as usize];
+    let call_amount = state.min_bet - current_player.bet_chips;
+    if call_amount > CHIP_EPSILON {
+        return false;
+    }
+
+    active_players
+        .iter()
+        .filter(|ps| ps.stake > CHIP_EPSILON)
+        .count()
+        <= 1
+}
+
+fn runout_forced_checkdown(state: &mut State) {
+    while state.stage != Stage::Showdown && is_forced_checkdown(state) {
+        state.to_next_stage();
+    }
 }
 
 // Modified to accept state parameter for verbose control
