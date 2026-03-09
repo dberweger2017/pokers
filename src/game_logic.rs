@@ -366,10 +366,22 @@ fn legal_actions(state: &State) -> Vec<ActionEnum> {
         illegal_actions.push(ActionEnum::Check);
     }
 
+    if !current_player_can_raise(state) {
+        illegal_actions.push(ActionEnum::Raise);
+    }
+
     let legal_actions: Vec<ActionEnum> = ActionEnum::iter()
         .filter(|a| !illegal_actions.contains(a))
         .collect();
     legal_actions
+}
+
+fn current_player_can_raise(state: &State) -> bool {
+    let player_state = state.players_state[state.current_player as usize];
+    let call_amount = f64::max(0.0, state.min_bet - player_state.bet_chips);
+    let remaining_stake_after_call = player_state.stake - call_amount;
+
+    remaining_stake_after_call > CHIP_EPSILON
 }
 
 fn is_forced_checkdown(state: &State) -> bool {
