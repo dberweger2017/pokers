@@ -1,14 +1,11 @@
 // state/action.rs
 #![allow(unused)]
 use crate::state::stage::Stage;
-#[cfg(test)]
-use proptest_derive::Arbitrary;
 use pyo3::prelude::*;
 use strum_macros::EnumIter;
 
 #[pyclass]
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(test, derive(Arbitrary))]
 pub struct Action {
     #[pyo3(get, set)]
     pub action: ActionEnum,
@@ -31,7 +28,6 @@ impl Action {
 
 #[pyclass]
 #[derive(Debug, Clone, Copy, EnumIter, PartialEq, Eq)]
-#[cfg_attr(test, derive(Arbitrary))]
 pub enum ActionEnum {
     Fold,
     Check,
@@ -41,7 +37,6 @@ pub enum ActionEnum {
 
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(test, derive(Arbitrary))]
 pub struct ActionRecord {
     #[pyo3(get, set)]
     pub player: u64,

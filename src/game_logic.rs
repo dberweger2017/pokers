@@ -1,40 +1,31 @@
-// game_logic.rs
 use itertools::Itertools;
-use pyo3::exceptions::PyOSError;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand::{seq::SliceRandom, SeedableRng};
-use strum::IntoEnumIterator;
 
 use crate::state::action::{Action, ActionEnum, ActionRecord};
-use crate::state::card::{Card, CardRank, CardSuit};
+use crate::state::card::Card;
 use crate::state::stage::Stage;
 use crate::state::{PlayerState, State, StateStatus};
 
-// Define a macro for verbose printing
-macro_rules! verbose_println {
-    ($state:expr, $($arg:tt)*) => {
-        if $state.verbose {
-            println!($($arg)*);
-        }
-    };
-}
+// Bound conversion error and leave ample room for exact sums across ten seats.
+const MAX_CHIPS: u64 = 1_000_000_000_000;
 
-const CHIP_EPSILON: f64 = 1e-9;
-
-pub struct InitStateError {
-    msg: String,
-}
-
-impl std::convert::From<InitStateError> for PyErr {
-    fn from(err: InitStateError) -> PyErr {
-        PyOSError::new_err(err.msg)
+fn chips(amount: f64, unit: f64) -> Option<u64> {
+    if !amount.is_finite() || amount < 0.0 {
+        return None;
     }
+    let scaled = amount / unit;
+    if !scaled.is_finite() || scaled > MAX_CHIPS as f64 || (scaled - scaled.round()).abs() > 1e-4 {
+        return None;
+    }
+    Some(scaled.round() as u64)
 }
 
 #[pymethods]
 impl State {
     #[staticmethod]
-    #[pyo3(signature = (n_players, button, sb, bb, stake, seed, verbose=false))]
+    #[pyo3(signature = (n_players, button, sb, bb, stake, seed, verbose=false, chip_unit=0.01, stakes=None))]
     pub fn from_seed(
         n_players: u64,
         button: u64,
@@ -43,16 +34,18 @@ impl State {
         stake: f64,
         seed: u64,
         verbose: bool,
-    ) -> Result<State, InitStateError> {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let mut deck: Vec<Card> = Card::collect();
-        deck.shuffle(&mut rng);
-
-        State::from_deck(n_players, button, sb, bb, stake, deck, verbose)
+        chip_unit: f64,
+        stakes: Option<Vec<f64>>,
+    ) -> PyResult<State> {
+        let mut deck = Card::collect();
+        deck.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+        Self::from_deck(
+            n_players, button, sb, bb, stake, deck, verbose, chip_unit, stakes,
+        )
     }
 
     #[staticmethod]
-    #[pyo3(signature = (n_players, button, sb, bb, stake, deck, verbose=false))]
+    #[pyo3(signature = (n_players, button, sb, bb, stake, deck, verbose=false, chip_unit=0.01, stakes=None))]
     pub fn from_deck(
         n_players: u64,
         button: u64,
@@ -61,590 +54,483 @@ impl State {
         stake: f64,
         mut deck: Vec<Card>,
         verbose: bool,
-    ) -> Result<State, InitStateError> {
-        if n_players < 2 {
-            return Err(InitStateError {
-                msg: "The number of players must be 2 or more".to_owned(),
-            });
+        chip_unit: f64,
+        stakes: Option<Vec<f64>>,
+    ) -> PyResult<State> {
+        if !(2..=10).contains(&n_players) || button >= n_players {
+            return Err(PyValueError::new_err(
+                "Expected 2–10 players and an occupied button seat",
+            ));
         }
-
-        if button >= n_players {
-            return Err(InitStateError {
-                msg: "The button must be between the players".to_owned(),
-            });
+        if !chip_unit.is_finite() || chip_unit <= 0.0 {
+            return Err(PyValueError::new_err(
+                "chip_unit must be finite and positive",
+            ));
         }
-
-        if deck.len() < 2 * n_players as usize {
-            return Err(InitStateError {
-                msg: "The number of cards in the deck must be at least 2*n_players".to_owned(),
-            });
+        if deck.len() != 52 || deck.iter().enumerate().any(|(i, c)| deck[..i].contains(c)) {
+            return Err(PyValueError::new_err(
+                "Expected a complete deck of 52 distinct cards",
+            ));
         }
-
-        if sb < 0.0 {
-            return Err(InitStateError {
-                msg: "The small blind must be greater than 0".to_owned(),
-            });
-        }
-
-        if bb < sb {
-            return Err(InitStateError {
-                msg: "The small blind must be smaller or equal than the big blind".to_owned(),
-            });
-        }
-
-        if stake < bb {
-            return Err(InitStateError {
-                msg: "The stake must be greater or equal than the big blind".to_owned(),
-            });
-        }
-
-        let mut players_state: Vec<PlayerState> = Vec::new();
-        for i in 0..n_players {
-            let player = (button + i + 1) % n_players;
-            let chips = match i {
-                _ if player == (button + 1) % n_players => sb,
-                _ if player == (button + 2) % n_players => bb,
-                _ => 0.0,
-            };
-
-            let p_state = PlayerState {
-                player: player,
-                hand: (deck.remove(0), deck.remove(0)),
-                bet_chips: chips,
-                pot_chips: 0.0,
-                stake: stake - chips,
-                reward: 0.0,
-                active: true,
-                last_stage_action: None,
-            };
-            players_state.push(p_state);
-        }
-
-        players_state.sort_by_key(|ps| ps.player);
-
-        let mut state = State {
-            current_player: (button + 3) % n_players,
-            players_state: players_state,
-            public_cards: Vec::new(),
-            stage: Stage::Preflop,
-            button: button,
-            from_action: None,
-            legal_actions: Vec::new(),
-            deck: deck,
-            final_state: false,
-            pot: sb + bb,
-            min_bet: bb,
-            status: StateStatus::Ok,
-            verbose: verbose,
+        let convert = |value| {
+            chips(value, chip_unit).ok_or_else(||
+            PyValueError::new_err("Amounts must be finite nonnegative multiples of chip_unit within the supported range"))
         };
-
-        state.legal_actions = legal_actions(&state);
+        let sb = convert(sb)?;
+        let bb = convert(bb)?;
+        if sb == 0 || bb < sb {
+            return Err(PyValueError::new_err(
+                "Expected 0 < small blind <= big blind",
+            ));
+        }
+        let amounts = stakes.unwrap_or_else(|| vec![stake; n_players as usize]);
+        if amounts.len() != n_players as usize {
+            return Err(PyValueError::new_err(
+                "stakes must contain one starting stack per seat",
+            ));
+        }
+        let amounts: Vec<u64> = amounts.into_iter().map(convert).collect::<PyResult<_>>()?;
+        if amounts.contains(&0) {
+            return Err(PyValueError::new_err(
+                "Every dealt-in player must have a positive stack",
+            ));
+        }
+        let n = n_players as usize;
+        let button = button as usize;
+        let sb_seat = if n == 2 { button } else { (button + 1) % n };
+        let bb_seat = (sb_seat + 1) % n;
+        // Deal one card per seat per round, starting left of the button.
+        let mut hands = vec![(deck[0], deck[0]); n];
+        for round in 0..2 {
+            for offset in 1..=n {
+                let seat = (button + offset) % n;
+                let card = deck.remove(0);
+                if round == 0 {
+                    hands[seat].0 = card;
+                } else {
+                    hands[seat].1 = card;
+                }
+            }
+        }
+        let players_state: Vec<_> = (0..n)
+            .map(|seat| {
+                let blind = if seat == sb_seat {
+                    sb
+                } else if seat == bb_seat {
+                    bb
+                } else {
+                    0
+                };
+                let posted = blind.min(amounts[seat]);
+                PlayerState {
+                    player: seat as u64,
+                    hand: hands[seat],
+                    bet_chips: posted,
+                    pot_chips: 0,
+                    stake: amounts[seat] - posted,
+                    initial_stake: amounts[seat],
+                    reward: 0,
+                    chip_unit,
+                    active: true,
+                    pending: amounts[seat] > posted,
+                    acted_at: None,
+                }
+            })
+            .collect();
+        let pot = players_state.iter().map(|p| p.bet_chips).sum();
+        let mut state = State {
+            current_player: bb_seat as u64,
+            players_state,
+            public_cards: vec![],
+            stage: Stage::Preflop,
+            button: button as u64,
+            from_action: None,
+            legal_actions: vec![],
+            deck,
+            pot,
+            min_bet: bb,
+            bb,
+            last_full_raise: bb,
+            chip_unit,
+            final_state: false,
+            status: StateStatus::Ok,
+            verbose,
+        };
+        state.advance(bb_seat);
         Ok(state)
     }
 
-    pub fn apply_action(&self, action: Action) -> State {
-        match self.status {
-            StateStatus::Ok => (),
-            _ => return self.clone(),
-        }
+    #[getter]
+    pub fn pot(&self) -> f64 {
+        self.pot as f64 * self.chip_unit
+    }
+    #[getter]
+    pub fn min_bet(&self) -> f64 {
+        self.min_bet as f64 * self.chip_unit
+    }
+    #[getter]
+    pub fn bb(&self) -> f64 {
+        self.bb as f64 * self.chip_unit
+    }
+    #[getter]
+    pub fn min_raise(&self) -> f64 {
+        self.last_full_raise as f64 * self.chip_unit
+    }
 
-        if self.final_state {
+    pub fn apply_action(&self, action: Action) -> State {
+        if self.status != StateStatus::Ok || self.final_state {
             return self.clone();
         }
-
-        let mut new_state = self.clone();
-        new_state.from_action = Some(ActionRecord {
+        let mut next = self.clone();
+        next.from_action = Some(ActionRecord {
             player: self.current_player,
-            action: action,
+            action,
             stage: self.stage,
             legal_actions: self.legal_actions.clone(),
         });
-
         if !self.legal_actions.contains(&action.action) {
-            return State {
-                status: StateStatus::IllegalAction,
-                final_state: true,
-                ..new_state
-            };
+            return next.rejected(StateStatus::IllegalAction);
         }
-
-        let player = self.current_player as usize;
-
+        let seat = self.current_player as usize;
+        let player = self.players_state[seat];
+        let to_call = self.min_bet.saturating_sub(player.bet_chips);
         match action.action {
             ActionEnum::Fold => {
-                new_state.players_state[player].active = false;
-                new_state.players_state[player].pot_chips += self.players_state[player].bet_chips;
-                new_state.players_state[player].bet_chips = 0.0;
-                new_state.players_state[player].reward =
-                    -(new_state.players_state[player].pot_chips as f64);
+                next.players_state[seat].active = false;
             }
-
+            ActionEnum::Check => {}
             ActionEnum::Call => {
-                let raised_chips = self.min_bet - self.players_state[player].bet_chips;
-                new_state.players_state[player].bet_chips += raised_chips;
-                new_state.players_state[player].stake -= raised_chips;
-                new_state.pot += raised_chips;
+                next.commit(seat, to_call.min(player.stake));
             }
-
             ActionEnum::Raise => {
-                let bet = (self.min_bet - self.players_state[player].bet_chips) + action.amount;
-                if bet > self.players_state[player].stake {
-                    return State {
-                        status: StateStatus::HighBet,
-                        final_state: true,
-                        ..new_state
-                    };
+                let amount = match chips(action.amount, self.chip_unit) {
+                    Some(value) => value,
+                    None => return next.rejected(StateStatus::InvalidAmount),
+                };
+                let available = player.stake.saturating_sub(to_call);
+                if amount > available {
+                    return next.rejected(StateStatus::HighBet);
                 }
-                new_state.players_state[player].bet_chips += bet;
-                new_state.players_state[player].stake -= bet;
-                new_state.pot += bet;
-                new_state.min_bet = new_state.players_state[player].bet_chips
+                if amount == 0 || (amount < self.last_full_raise && amount != available) {
+                    return next.rejected(StateStatus::LowBet);
+                }
+                next.commit(seat, to_call + amount);
+                next.min_bet = next.players_state[seat].bet_chips;
+                if amount >= self.last_full_raise {
+                    next.last_full_raise = amount;
+                }
+                for (index, other) in next.players_state.iter_mut().enumerate() {
+                    if index != seat
+                        && other.active
+                        && other.stake > 0
+                        && other.bet_chips < next.min_bet
+                    {
+                        other.pending = true;
+                    }
+                }
             }
-
-            ActionEnum::Check => (),
-        };
-
-        new_state.players_state[player].last_stage_action = Some(action.action);
-
-        new_state.current_player = (self.current_player + 1) % self.players_state.len() as u64;
-        while !self.players_state[new_state.current_player as usize].active {
-            new_state.current_player =
-                (new_state.current_player + 1) % self.players_state.len() as u64;
         }
-
-        // The betting round ends if:
-        // Theres two or more active players
-        let active_players: Vec<PlayerState> = new_state
-            .players_state
-            .iter()
-            .copied()
-            .filter(|ps| ps.active)
-            .collect();
-        let multiple_active = active_players.len() >= 2;
-        // Every active player has done an action
-        let is_last_player = active_players.iter().all(|ps| ps.last_stage_action != None);
-        // And every active player has bet the same amount
-        let all_same_bet = active_players
-            .iter()
-            .all(|ps| ps.bet_chips == new_state.min_bet);
-
-        let round_ended = multiple_active && is_last_player && all_same_bet;
-
-        if round_ended {
-            new_state.to_next_stage();
-            runout_forced_checkdown(&mut new_state);
+        next.players_state[seat].pending = false;
+        // Checking before the first wager does not surrender the right to raise
+        // an opening all-in that is smaller than the minimum bet.
+        if action.action != ActionEnum::Check {
+            next.players_state[seat].acted_at = Some(next.min_bet);
         }
-
-        // The game ends if the players have reached the showdown or every player except one has folded
-        if active_players.len() == 1 {
-            new_state.set_winners(vec![active_players[0].player]);
-        }
-
-        if new_state.stage == Stage::Showdown {
-            let ranks: Vec<(u64, u64, u64)> = active_players
-                .iter()
-                .map(|ps| rank_hand(&new_state, ps.hand, &new_state.public_cards))
-                .collect();
-            let min_rank = ranks.iter().copied().min().unwrap();
-            
-            // Use verbose_println! macro instead of println!
-            verbose_println!(&new_state, "Ranks: {:?}", ranks);
-            
-            let winners_indices: Vec<usize> = ranks
-                .iter()
-                .enumerate()
-                .filter(|(_, &r)| r == min_rank)
-                .map(|(i, _)| i)
-                .collect();
-                
-            // Use verbose_println! macro instead of println!    
-            verbose_println!(&new_state, "Winner id: {:?}", winners_indices);
-            
-            new_state.set_winners(
-                winners_indices
-                    .iter()
-                    .map(|&i| active_players[i].player)
-                    .collect(),
-            );
-        }
-
-        new_state.legal_actions = legal_actions(&new_state);
-        new_state
+        next.advance(seat);
+        next
     }
 
-    fn set_winners(&mut self, winners: Vec<u64>) {
-        assert!(winners.iter().all(|&p| p < self.players_state.len() as u64));
+    pub fn __str__(&self) -> String {
+        format!("{:#?}", self)
+    }
+}
 
-        let winner_reward = self
-            .players_state
-            .iter()
-            .filter(|&&ps| !winners.contains(&ps.player))
-            .map(|ps| ps.pot_chips + ps.bet_chips)
-            .fold(0.0, |c1, c2| c1 + c2)
-            / winners.len() as f64;
-
-        self.players_state = self
-            .players_state
-            .iter()
-            .map(|ps| PlayerState {
-                pot_chips: 0.0,
-                bet_chips: 0.0,
-                reward: if winners.contains(&ps.player) {
-                    winner_reward
-                } else {
-                    -(ps.pot_chips + ps.bet_chips as f64)
-                },
-                active: false,
-                ..*ps
-            })
-            .collect();
-
+impl State {
+    fn rejected(mut self, status: StateStatus) -> Self {
+        self.status = status;
         self.final_state = true;
+        self.legal_actions.clear();
+        self
     }
 
-    fn to_next_stage(&mut self) {
+    fn commit(&mut self, seat: usize, amount: u64) {
+        let player = &mut self.players_state[seat];
+        player.stake -= amount;
+        player.bet_chips += amount;
+        self.pot += amount;
+    }
+
+    fn advance(&mut self, after: usize) {
+        let n = self.players_state.len();
+        let active = self.players_state.iter().filter(|p| p.active).count();
+        if active == 1 {
+            self.settle();
+            return;
+        }
+        let able: Vec<_> = (0..n)
+            .filter(|&i| self.players_state[i].active && self.players_state[i].stake > 0)
+            .collect();
+        if able.len() <= 1 {
+            if let Some(&seat) = able.first() {
+                // No side betting against all-in players. Return unmatched excess at settlement.
+                let actual_bet = self
+                    .players_state
+                    .iter()
+                    .filter(|p| p.active)
+                    .map(|p| p.bet_chips)
+                    .max()
+                    .unwrap();
+                self.min_bet = actual_bet;
+                self.players_state[seat].pending = self.players_state[seat].bet_chips < actual_bet;
+            }
+        }
+        if let Some(seat) = (1..=n).map(|offset| (after + offset) % n).find(|&i| {
+            let p = self.players_state[i];
+            p.active && p.stake > 0 && p.pending
+        }) {
+            self.current_player = seat as u64;
+            self.legal_actions = self.available_actions();
+            return;
+        }
+        if able.len() <= 1 {
+            while self.stage != Stage::Showdown {
+                self.next_street();
+            }
+            self.settle();
+        } else {
+            self.next_street();
+            if self.stage == Stage::Showdown {
+                self.settle();
+            } else {
+                self.advance(self.button as usize);
+            }
+        }
+    }
+
+    fn available_actions(&self) -> Vec<ActionEnum> {
+        if self.final_state {
+            return vec![];
+        }
+        let p = self.players_state[self.current_player as usize];
+        let to_call = self.min_bet.saturating_sub(p.bet_chips);
+        let mut actions = vec![ActionEnum::Fold];
+        actions.push(if to_call == 0 {
+            ActionEnum::Check
+        } else {
+            ActionEnum::Call
+        });
+        let reopened = p.acted_at.map_or(true, |previous| {
+            self.min_bet.saturating_sub(previous) >= self.last_full_raise
+        });
+        let opponent_can_bet = self.players_state.iter().any(|other| {
+            other.player != p.player && other.active && other.stake + other.bet_chips > self.min_bet
+        });
+        if reopened && opponent_can_bet && p.stake > to_call {
+            actions.push(ActionEnum::Raise);
+        }
+        actions
+    }
+
+    fn next_street(&mut self) {
         self.stage = match self.stage {
             Stage::Preflop => Stage::Flop,
             Stage::Flop => Stage::Turn,
             Stage::Turn => Stage::River,
             _ => Stage::Showdown,
         };
-        let n_deal_cards = match self.stage {
+        let count = match self.stage {
             Stage::Flop => 3,
             Stage::Turn | Stage::River => 1,
             _ => 0,
         };
-        for _ in 0..n_deal_cards {
-            self.public_cards.push(self.deck.remove(0))
+        for _ in 0..count {
+            self.public_cards.push(self.deck.remove(0));
         }
-        self.players_state = self
+        for p in &mut self.players_state {
+            p.pot_chips += p.bet_chips;
+            p.bet_chips = 0;
+            p.acted_at = None;
+            p.pending = p.active && p.stake > 0;
+        }
+        self.min_bet = 0;
+        self.last_full_raise = self.bb;
+    }
+
+    fn settle(&mut self) {
+        let contributions: Vec<_> = self
             .players_state
             .iter()
-            .map(|ps| PlayerState {
-                pot_chips: ps.pot_chips + ps.bet_chips,
-                bet_chips: 0.0,
-                last_stage_action: None,
-                ..*ps
+            .map(|p| p.pot_chips + p.bet_chips)
+            .collect();
+        let mut levels = contributions.clone();
+        levels.sort_unstable();
+        levels.dedup();
+        let survivors: Vec<_> = self
+            .players_state
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.active)
+            .map(|(i, _)| i)
+            .collect();
+        let ranks: Vec<_> = self
+            .players_state
+            .iter()
+            .map(|p| {
+                if survivors.len() > 1 && p.active {
+                    rank_hand(p.hand, &self.public_cards)
+                } else {
+                    (0, 0, 0)
+                }
             })
             .collect();
-
-        self.min_bet = 0.0;
-
-        self.current_player = (self.button + 1) % self.players_state.len() as u64;
-        while !self.players_state[self.current_player as usize].active {
-            self.current_player = (self.current_player + 1) % self.players_state.len() as u64;
+        let mut pots: Vec<(Vec<usize>, u64)> = Vec::new();
+        let mut previous = 0;
+        for level in levels {
+            let contributors: Vec<_> = contributions
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c >= level)
+                .map(|(i, _)| i)
+                .collect();
+            let amount = (level - previous) * contributors.len() as u64;
+            previous = level;
+            if amount == 0 {
+                continue;
+            }
+            if contributors.len() == 1 {
+                self.players_state[contributors[0]].stake += amount;
+                continue;
+            }
+            let eligible: Vec<_> = contributors
+                .iter()
+                .copied()
+                .filter(|&i| self.players_state[i].active)
+                .collect();
+            // Folded contributions add dead money; they must not split a pot
+            // into extra rounding events when eligibility has not changed.
+            if let Some((last_eligible, last_amount)) = pots.last_mut() {
+                if *last_eligible == eligible {
+                    *last_amount += amount;
+                    continue;
+                }
+            }
+            pots.push((eligible, amount));
         }
-    }
-
-    pub fn __str__(&self) -> PyResult<String> {
-        Ok(format!("{:#?}", self))
+        for (eligible, amount) in pots {
+            let winners = if survivors.len() == 1 {
+                survivors.clone()
+            } else {
+                let best = eligible
+                    .iter()
+                    .map(|&i| ranks[i])
+                    .min()
+                    .expect("A contested pot must have an eligible player");
+                eligible
+                    .into_iter()
+                    .filter(|&i| ranks[i] == best)
+                    .collect::<Vec<_>>()
+            };
+            let share = amount / winners.len() as u64;
+            let mut remainder = amount % winners.len() as u64;
+            for offset in 1..=self.players_state.len() {
+                let seat = (self.button as usize + offset) % self.players_state.len();
+                if winners.contains(&seat) {
+                    self.players_state[seat].stake += share + u64::from(remainder > 0);
+                    remainder = remainder.saturating_sub(1);
+                }
+            }
+        }
+        for p in &mut self.players_state {
+            p.reward = p.stake as i64 - p.initial_stake as i64;
+            p.bet_chips = 0;
+            p.pot_chips = 0;
+            p.pending = false;
+        }
+        self.pot = 0;
+        self.final_state = true;
+        self.legal_actions.clear();
     }
 }
 
-#[pyfunction]
-fn legal_actions(state: &State) -> Vec<ActionEnum> {
-    let mut illegal_actions: Vec<ActionEnum> = Vec::new();
-    match state.stage {
-        Stage::Showdown => illegal_actions.append(&mut ActionEnum::iter().collect()),
-        Stage::Preflop => {}
-        _ => (),
-    }
-
-    if state.final_state {
-        illegal_actions.append(&mut ActionEnum::iter().collect());
-    }
-
-    if is_forced_checkdown(state) {
-        return vec![ActionEnum::Check];
-    }
-
-    if state.min_bet == 0.0 {
-        illegal_actions.push(ActionEnum::Call);
-    }
-
-    if state.min_bet != 0.0 {
-        illegal_actions.push(ActionEnum::Check);
-    }
-
-    if !current_player_can_raise(state) {
-        illegal_actions.push(ActionEnum::Raise);
-    }
-
-    let legal_actions: Vec<ActionEnum> = ActionEnum::iter()
-        .filter(|a| !illegal_actions.contains(a))
-        .collect();
-    legal_actions
-}
-
-fn current_player_can_raise(state: &State) -> bool {
-    let player_state = state.players_state[state.current_player as usize];
-    let call_amount = f64::max(0.0, state.min_bet - player_state.bet_chips);
-    let remaining_stake_after_call = player_state.stake - call_amount;
-
-    remaining_stake_after_call > CHIP_EPSILON
-}
-
-fn is_forced_checkdown(state: &State) -> bool {
-    let active_players: Vec<PlayerState> = state
-        .players_state
+fn rank_hand(private: (Card, Card), public: &[Card]) -> (u8, u64, u64) {
+    public
         .iter()
         .copied()
-        .filter(|ps| ps.active)
-        .collect();
-
-    if active_players.len() < 2 {
-        return false;
-    }
-
-    let current_player = state.players_state[state.current_player as usize];
-    let call_amount = state.min_bet - current_player.bet_chips;
-    if call_amount > CHIP_EPSILON {
-        return false;
-    }
-
-    active_players
-        .iter()
-        .filter(|ps| ps.stake > CHIP_EPSILON)
-        .count()
-        <= 1
-}
-
-fn runout_forced_checkdown(state: &mut State) {
-    while state.stage != Stage::Showdown && is_forced_checkdown(state) {
-        state.to_next_stage();
-    }
-}
-
-// Modified to accept state parameter for verbose control
-fn rank_hand(state: &State, private_cards: (Card, Card), public_cards: &Vec<Card>) -> (u64, u64, u64) {
-    let mut cards = public_cards.clone();
-    cards.append(&mut vec![private_cards.0, private_cards.1]);
-
-    let min_rank = cards
-        .iter()
-        .copied()
+        .chain([private.0, private.1])
         .combinations(5)
-        .map(|comb| rank_card_combination(comb))
+        .map(|cards| rank_five(&cards))
         .min()
-        .unwrap();
-
-    min_rank
+        .unwrap()
 }
 
-fn rank_card_combination(cards: Vec<Card>) -> (u64, u64, u64) {
-    let mut ordered_cards = cards.clone();
-    ordered_cards.sort_by_key(|c| c.rank);
-    let suits: Vec<CardSuit> = ordered_cards.iter().map(|c| c.suit).collect();
-    let ranks: Vec<CardRank> = ordered_cards.iter().map(|c| c.rank).collect();
-
-    let suit_duplicates: Vec<(usize, CardSuit)> = suits
-        .iter()
-        .copied()
-        .dedup_with_count()
-        .sorted_by_key(|(n, _)| n.clone())
-        .rev()
-        .collect();
-
-    let rank_duplicates: Vec<(usize, CardRank)> = ranks
-        .iter()
-        .copied()
-        .dedup_with_count()
-        .sorted_by_key(|(n, _)| n.clone())
-        .rev()
-        .collect();
-
-    let ranks_in_sequence = ranks
-        .windows(2)
-        .map(|x| x[1] as i32 - x[0] as i32)
-        .all(|d| d == 1)
-        || ranks
-            == vec![
-                CardRank::R2,
-                CardRank::R3,
-                CardRank::R4,
-                CardRank::R5,
-                CardRank::RA,
-            ];
-
-    // Royal flush: A, K, Q, J, 10, all the same suit.
-    if ranks[..]
-        == [
-            CardRank::RT,
-            CardRank::RJ,
-            CardRank::RQ,
-            CardRank::RK,
-            CardRank::RA,
-        ]
-        && suit_duplicates[0].0 == 5
-    {
-        return (1, 0, 0_u64);
+fn rank_five(cards: &[Card]) -> (u8, u64, u64) {
+    let mut ranks: Vec<_> = cards.iter().map(|c| c.rank as u64).collect();
+    ranks.sort_unstable_by(|a, b| b.cmp(a));
+    let flush = cards.iter().all(|c| c.suit == cards[0].suit);
+    let wheel = ranks == [12, 3, 2, 1, 0];
+    let straight = wheel || ranks.windows(2).all(|w| w[0] == w[1] + 1);
+    let high = if wheel { 3 } else { ranks[0] };
+    let mut groups: Vec<(usize, u64)> = ranks.iter().copied().dedup_with_count().collect();
+    groups.sort_unstable_by(|a, b| b.cmp(a));
+    let score = |values: Vec<u64>| {
+        values
+            .into_iter()
+            .fold(0, |acc, rank| acc * 13 + (12 - rank))
+    };
+    let kickers = score(ranks.clone());
+    if straight && flush {
+        return (0, 12 - high, 0);
     }
-    // Straight flush: Five cards in a sequence, all in the same suit.
-    if ranks_in_sequence && suit_duplicates[0].0 == 5 {
-        return (2, high_card_value(&ranks), 0_u64);
+    if groups[0].0 == 4 {
+        return (1, 12 - groups[0].1, kickers);
     }
-    // 3. Four of a kind: All four cards of the same rank.
-    if rank_duplicates[0].0 == 4 {
-        let relevant_ranks = vec![rank_duplicates[0].1];
-        return (3, high_card_value(&relevant_ranks), high_card_value(&ranks));
+    if groups[0].0 == 3 && groups[1].0 == 2 {
+        return (2, 12 - groups[0].1, kickers);
     }
-    // 4. Full house: Three of a kind with a pair.
-    if rank_duplicates[0].0 == 3 && rank_duplicates[1].0 == 2 {
-        let relevant_ranks = vec![rank_duplicates[0].1];
-        return (4, high_card_value(&relevant_ranks), high_card_value(&ranks));
+    if flush {
+        return (3, kickers, 0);
     }
-    // 5. Flush: Any five cards of the same suit, but not in a sequence.
-    if suit_duplicates[0].0 == 5 {
-        return (5, high_card_value(&ranks), 0_u64);
+    if straight {
+        return (4, 12 - high, 0);
     }
-    // 6. Straight: Five cards in a sequence, but not of the same suit.
-    if ranks_in_sequence {
-        return (6, high_card_value(&ranks), 0_u64);
+    if groups[0].0 == 3 {
+        return (5, 12 - groups[0].1, kickers);
     }
-    // 7. Three of a kind: Three cards of the same rank.
-    if rank_duplicates[0].0 == 3 {
-        let relevant_ranks = vec![rank_duplicates[0].1];
-        return (7, high_card_value(&relevant_ranks), high_card_value(&ranks));
+    if groups[0].0 == 2 && groups[1].0 == 2 {
+        return (6, score(vec![groups[0].1, groups[1].1]), kickers);
     }
-    // 8. Two pair: Two different pairs.
-    if rank_duplicates[0].0 == 2 && rank_duplicates[1].0 == 2 {
-        let relevant_ranks = vec![rank_duplicates[0].1, rank_duplicates[1].1];
-        return (8, high_card_value(&relevant_ranks), high_card_value(&ranks));
+    if groups[0].0 == 2 {
+        return (7, 12 - groups[0].1, kickers);
     }
-    // 9. Pair: Two cards of the same rank.
-    if rank_duplicates[0].0 == 2 {
-        let relevant_ranks = vec![rank_duplicates[0].1];
-        return (9, high_card_value(&relevant_ranks), high_card_value(&ranks));
-    }
-
-    // 10. High Card: When you haven't made any of the hands above, the highest card plays.
-    (10, high_card_value(&ranks), 0_u64)
+    (8, kickers, 0)
 }
 
-fn high_card_value(ranks: &Vec<CardRank>) -> u64 {
-    let mut value: u64 = 0;
-    for (i, &r) in ranks.iter().sorted().enumerate() {
-        value += (13_u64.pow(i as u32)) * (12 - r as u64);
-    }
-    value
-}
-
+#[cfg(test)]
 mod tests {
-    #[cfg(test)]
     use super::*;
-    #[cfg(test)]
     use proptest::prelude::*;
 
-    #[cfg(test)]
     proptest! {
         #[test]
-        fn from_deck_doesnt_crash(n_players in 0..10000, deck: Vec<Card>, sb in 0.5_f64..100.0_f64, bb_mult in 2..5, stake_mult in 100..1000, actions: Vec<Action>) {
-            let initial_state = State::from_deck(n_players as u64, 0, sb, sb * bb_mult as f64, sb * stake_mult as f64, deck, false);
-            match initial_state {
-                Ok(mut s) => {
-                    for a in actions {
-                        s = s.apply_action(a);
-                    }
-                },
-                Err(_) => return Ok(())
-            };
-
-        }
-
-        #[test]
-        fn zero_sum_game(n_players in 2..26, seed: u64, sb in 0.5_f64..100.0_f64, bb_mult in 2..5, stake_mult in 100..1000, actions in prop::collection::vec(Action::arbitrary_with(((), ())).prop_filter("Raise abs amount bellow 1e12",
-        |a| a.amount.abs() < 1e12), 1..100)) {
-            let initial_state = State::from_seed(n_players as u64, 0, sb, sb * bb_mult as f64, sb * stake_mult as f64, seed, false);
-            match initial_state {
-                Ok(mut s) => {
-                    for a in actions {
-                        s = s.apply_action(a);
-                        if s.final_state {
-                            let sum_rewards = s.players_state.iter().map(|ps| ps.reward).fold(0_f64, |r1, r2| r1 + r2);
-                            println!("sum_rewards = {sum_rewards}");
-                            prop_assert!(sum_rewards < 1e-12);
-                        }
-                    }
-                },
-                Err(err) => {
-                    println!("{}", err.msg);
-                    prop_assert!(false);
-                }
-            };
-        }
-
-        #[test]
-        fn call_and_check_no_legal_at_same_time(n_players in 2..26, sb in 0.5_f64..100.0_f64, bb_mult in 2..5, stake_mult in 100..1000, actions in prop::collection::vec(Action::arbitrary_with(((), ())), 1..100)) {
-            let initial_state = State::from_seed(n_players as u64, 0, sb, sb * bb_mult as f64, sb * stake_mult as f64, 1234, false);
-            match initial_state {
-                Ok(mut s) => {
-                    for a in actions {
-                        s = s.apply_action(a);
-                        if s.final_state {
-                            prop_assert!(!(s.legal_actions.contains(&ActionEnum::Check) && s.legal_actions.contains(&ActionEnum::Call)));
-                        }
-                    }
-                },
-                Err(err) => {
-                    println!("{}", err.msg);
-                    prop_assert!(false);
-                }
-            };
-        }
-
-        #[test]
-        fn illegal_raise_own_call(n_players in 2..26, sb in 0.5_f64..100.0_f64, bb_mult in 2..5, stake_mult in 100..1000, actions in prop::collection::vec(Action::arbitrary_with(((), ())), 1..100)) {
-            let initial_state = State::from_seed(n_players as u64, 0, sb, sb * bb_mult as f64, sb * stake_mult as f64, 1234, false);
-            match initial_state {
-                Ok(mut s) => {
-                    for a in actions {
-                        s = s.apply_action(a);
-                        let call_done = s.players_state[s.current_player as usize].last_stage_action == Some(ActionEnum::Call);
-                        let not_other_raise = !s.players_state.iter().filter(|ps| ps.active).any(|ps| ps.last_stage_action == Some(ActionEnum::Raise));
-                        if call_done && not_other_raise {
-                            prop_assert!(!s.legal_actions.contains(&ActionEnum::Raise));
-                        }
-                    }
-                },
-                Err(err) => {
-                    println!("{}", err.msg);
-                    prop_assert!(false);
-                }
-            };
-        }
-
-        #[test]
-        fn illegal_call_zero_bets(n_players in 2..26, sb in 0.5_f64..100.0_f64, bb_mult in 2..5, stake_mult in 100..1000, actions in prop::collection::vec(Action::arbitrary_with(((), ())), 1..100)) {
-            let initial_state = State::from_seed(n_players as u64, 0, sb, sb * bb_mult as f64, sb * stake_mult as f64, 1234, false);
-            match initial_state {
-                Ok(mut s) => {
-                    for a in actions {
-                        s = s.apply_action(a);
-                        prop_assert!(!(s.legal_actions.contains(&ActionEnum::Call) && s.min_bet == 0.0));
-                    }
-                },
-                Err(err) => {
-                    println!("{}", err.msg);
-                    prop_assert!(false);
-                }
-            };
-        }
-
-        #[test]
-        fn from_action_not_none(n_players in 2..26, sb in 0.5_f64..100.0_f64, bb_mult in 2..5, stake_mult in 100..1000, actions in prop::collection::vec(Action::arbitrary_with(((), ())), 1..100)) {
-            let initial_state = State::from_seed(n_players as u64, 0, sb, sb * bb_mult as f64, sb * stake_mult as f64, 1234, false);
-            match initial_state {
-                Ok(mut s) => {
-                    for a in actions {
-                        s = s.apply_action(a);
-                        prop_assert!(s.from_action != None);
-                    }
-                },
-                Err(err) => {
-                    println!("{}", err.msg);
-                    prop_assert!(false);
-                }
-            };
+        fn legal_hands_terminate_and_conserve_chips(seed: u64, stacks in prop::collection::vec(1u64..=200, 2..=10), choice in prop::collection::vec(any::<usize>(), 1..300)) {
+            let n = stacks.len() as u64;
+            let total: u64 = stacks.iter().sum();
+            let amounts = stacks.iter().map(|&s| s as f64).collect();
+            let mut state = State::from_seed(n, seed % n, 1., 2., 200., seed, false, 1., Some(amounts)).unwrap();
+            for turn in 0..500 {
+                if state.final_state { break; }
+                let actions = state.legal_actions.clone();
+                let action = actions[choice[turn % choice.len()] % actions.len()];
+                let p = state.players_state[state.current_player as usize];
+                let maximum = p.stake.saturating_sub(state.min_bet.saturating_sub(p.bet_chips));
+                let minimum = state.last_full_raise.min(maximum);
+                let amount = minimum + choice[turn % choice.len()] as u64 % (maximum - minimum + 1);
+                state = state.apply_action(Action { action, amount: amount as f64 });
+                prop_assert_eq!(state.status, StateStatus::Ok);
+                prop_assert_eq!(state.players_state.iter().map(|p| p.stake + p.bet_chips + p.pot_chips).sum::<u64>(), total);
+            }
+            prop_assert!(state.final_state);
+            prop_assert_eq!(state.players_state.iter().map(|p| p.reward).sum::<i64>(), 0);
         }
     }
 }

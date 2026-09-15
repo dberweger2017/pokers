@@ -1,80 +1,66 @@
-[![CI](https://github.com/Reinforcement-Poker/pokers/actions/workflows/CI.yml/badge.svg)](https://github.com/Reinforcement-Poker/pokers/actions/workflows/CI.yml)
-[![PyPI version](https://badge.fury.io/py/pokers.svg)](https://badge.fury.io/py/pokers)
-
 # Pokers
 
-Embarrassingly simple no limit texas holdem environment for RL.
+[![CI](https://github.com/dberweger2017/pokers/actions/workflows/CI.yml/badge.svg)](https://github.com/dberweger2017/pokers/actions/workflows/CI.yml)
 
-## Why another poker environment?
+A small Rust no-limit Texas Hold'em simulator with Python bindings. Apply an action to a state to get a new state; the original remains available for another branch.
 
-Poker is an incredibly deep game with very simple rules, so why are all the environments so overly complex? Heck, someone could say that you need to publish a paper before building one (looking at you RLCard 👀). Pokers way is to discard the agent environment cycle and all that stuff, just the good old new_state = state + action model. Through its simplicity pokers tries to be flexible and easily integrable into any framework.
+This is the maintained fork used by [the Deep CFR poker project](https://github.com/dberweger2017/deepcfr-texas-no-limit-holdem-6-players), based on [Reinforcement-Poker/pokers](https://github.com/Reinforcement-Poker/pokers). Version 0.2 corrects betting, all-ins, side pots, heads-up order, and hand ranking, and uses integer chip accounting.
 
-### Why not to use pokers
-
-Pokers is a side project inside another side project. This means that it is guaranteed to have bugs, which is not very nice for a RL environment. We have done our best to minimize the errors, testing it against the 10k hands pluribus logs. However, this doesn't cover some areas of the state space, so if you need a more reliable environment RLCard is a better option.
+Read [RULES.md](RULES.md) for the supported cash-game profile, breaking changes, reference comparisons, and remaining scope. The engine handles a single hand with 2–10 players; table seating and changes between hands belong in a session layer.
 
 ## Installation
 
-Pokers can be installed directly from pypi.
+Use Python 3.10 or 3.11 and a Rust toolchain with the current PyO3 binding. This fork is installed from Git, not the upstream PyPI package:
 
 ```bash
-pip install pokers
+pip install "pokers @ git+https://github.com/dberweger2017/pokers.git@main"
 ```
+
+Applications and training manifests should pin a full commit hash instead of `main`.
 
 ## Usage
 
-Just create the initial state and act over it. Easy peasy.
 ```python
-import pokers as pkrs
+import pokers
 
-agents = [agent0, agent1, agent2, agent3, agent4, agent5] # Build the agents however you want
-initial_state = pkrs.State.from_seed(n_players=len(agents), button=0, sb=0.5, bb=1.0, stake=100.0, seed=1234)
-trace = [initial_state]
-
-while not trace[-1].final_state:
-    state = trace[-1]
-    action = agents[state.current_player].choose_action(trace)
-    new_state = state.apply_action(action)
-    trace.append(new_state)
+state = pokers.State.from_seed(
+    n_players=6, button=0, sb=1, bb=2, stake=200, seed=42, chip_unit=1,
+)
+# Seat 3 opens to 10: call 2, then raise by 8.
+next_state = state.apply_action(pokers.Action(pokers.ActionEnum.Raise, 8))
+assert next_state.status == pokers.StateStatus.Ok
+assert next_state.min_bet == 10
+assert next_state.min_raise == 8  # Next minimum raise-to: 18.
 ```
 
-The initial state can also be declared with a fixed deck with `State.from_deck()`.
+`stakes=[...]` overrides the common starting stack with one amount per seat. `State.from_deck` accepts a full, distinct 52-card deck for replaying a deal. [pokers.pyi](pokers.pyi) describes the Python interface.
 
-Curious about what info a state contains? Just go to [pokers.pyi](pokers.pyi) and see it yourself, I bet there's all you need.
+The simulator state contains **all private cards and the undealt deck**. A playing agent needs a separate player-observation interface. Do not pass this state directly to a policy that must only receive human-visible information.
 
-As a bonus you can print the entire hand as text. Who wants GUIs anyway?
-```python
-print(pkrs.visualize_trace(trace))
+### Actions and errors
+
+`Raise.amount` is the extra amount after calling, not the absolute raise-to total. Only exact multiples of `chip_unit` are accepted. `min_raise` is the last full increment; a smaller raise is legal only as an exact all-in.
+
+`legal_actions` lists action types. Calls and checks are distinct. The engine validates raise amounts when applying them. Invalid actions produce a terminal error state with status `IllegalAction`, `LowBet`, `HighBet`, or `InvalidAmount`, and move no chips. Check `status` before treating any terminal state as a completed hand. Applying another action to an already terminal state leaves it unchanged.
+
+Final stacks include winnings and refunds; reward is final minus starting stack. The pot and committed amounts are zero after settlement.
+
+### Batches and inspection
+
+`pokers.parallel_apply_action(states, actions)` applies one action per state using Rayon and preserves input order. Different list lengths are rejected. Completed states can remain in a batch while other hands finish.
+
+`pokers.visualize_state(state)` and `pokers.visualize_trace(states)` return diagnostic text, including privileged simulator information.
+
+## Development
+
+```bash
+pip install ".[dev]"
+cargo fmt --check
+cargo test --locked
+pytest -q
+POKERS_REFERENCE_SEEDS=1000 pytest tests/test_rules.py -q
 ```
 
-### Error handling
+Set `PYO3_PYTHON` to the virtual environment's interpreter before running Rust tests if the machine has multiple Python installations. The PokerKit comparison requires Python 3.11; core and fixture tests also run on 3.10.
 
-There are two possible types of erroneous states: when an illegal action is performed and when a player bets more chips than he has available. These cases are represented by the enum `StateStatus` with the values `IllegalAction` and `HighBet`, the value `Ok` is used for correct states. This information is stored in the field `status` of the state so you can filter them.
-
-Every erroneous state is also final. So applying an action over it will return the same exact state.
-
-
-### Parallel actions
-
-If you have a bunch of independent states and want to perform multiple actions in parallel you can easily trick the GIL with `parallel_apply_action()`.
-
-```python
-import pokers as pkrs
-
-agents = [agent0, agent1, agent2, agent3, agent4, agent5]
-states = [pkrs.State.from_seed(n_players=len(agents), button=0, sb=0.5, bb=1.0, stake=100.0, seed=seed) for seed in range(10)]
-
-while not all([s.final_state for s in states]):
-    actions = [agents[s.current_player].choose_action(s) for s in states]
-    states = pkrs.parallel_apply_action(states, actions)
-```
-
-Since final states do not change when an action is performed, you can safely wait for all hands in the batch to end.
-
-## Alternatives
-
-To our knowledge these are some other poker environments that you would want to consider.
-
-- [RLCard](https://github.com/datamllab/rlcard): Great RL environment for multiple card games.
-- [neuron_poker](https://github.com/dickreuter/neuron_poker): OpenAI gym for texas holdem.
-- [pgx](https://github.com/sotetsuk/pgx): Pretty cool project with jax-native game simulators. Sadly (at the moment) it doesn't implement NLTH.
+Tests include exact rule scenarios, generated hands with unequal stacks, and all 9,908 bundled Pluribus hands in serial and parallel. [RULES.md](RULES.md#verification) documents the reference differences and what these checks establish.
