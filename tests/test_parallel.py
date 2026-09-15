@@ -16,7 +16,9 @@ def test_parallel_apply_action_against_pluribus_logs():
         for pb_hand in pb_hand_batch:
             n_players = len(pb_hand["players"])
             button = pb_hand["button"]
-            str_deck = [c for hand in pb_hand["private_cards"] for c in hand]
+            str_deck = [
+                hand[round_] for round_ in range(2) for hand in pb_hand["private_cards"]
+            ]
             if "public_cards" in pb_hand:
                 if "flop" in pb_hand["public_cards"]:
                     str_deck += pb_hand["public_cards"]["flop"]
@@ -30,13 +32,23 @@ def test_parallel_apply_action_against_pluribus_logs():
                 assert c is not None
                 deck.append(c)
 
+            deck += [
+                c
+                for c in pkrs.Card.collect()
+                if not any(
+                    int(c.rank) == int(d.rank) and int(c.suit) == int(d.suit)
+                    for d in deck
+                )
+            ]
+
             pkrs_state = pkrs.State.from_deck(
                 n_players=n_players,
                 button=button,
                 deck=deck,
                 sb=50,
                 bb=100,
-                stake=float("inf"),
+                stake=10_000,
+                chip_unit=0.5,
             )
             pkrs_states.append(pkrs_state)
 
@@ -77,6 +89,13 @@ def test_parallel_apply_action_against_pluribus_logs():
                     )
                     assert pkrs_state.current_player == pb_action["player"]
                     assert pkrs_state.status == pkrs.StateStatus.Ok
+            actions = [
+                pkrs.Action(pkrs.ActionEnum.Check)
+                if a.action == pkrs.ActionEnum.Call
+                and pkrs.ActionEnum.Check in s.legal_actions
+                else a
+                for s, a in zip(pkrs_states, actions)
+            ]
             pkrs_states = pkrs.parallel_apply_action(pkrs_states, actions)
 
         for pkrs_state, pb_hand in zip(pkrs_states, pb_hand_batch):

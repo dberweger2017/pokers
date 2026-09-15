@@ -25,11 +25,22 @@ class State:
     min_bet: float
     final_state: bool
     status: StateStatus
-    verbose: bool  # New field for verbosity control
+    verbose: bool
+    bb: float
+    min_raise: float
+    chip_unit: float
 
     @staticmethod
     def from_seed(
-        n_players: int, button: int, sb: float, bb: float, stake: float, seed: int, verbose: bool = False
+        n_players: int,
+        button: int,
+        sb: float,
+        bb: float,
+        stake: float,
+        seed: int,
+        verbose: bool = False,
+        chip_unit: float = 0.01,
+        stakes: Optional[list[float]] = None,
     ) -> State: ...
     @staticmethod
     def from_deck(
@@ -40,6 +51,8 @@ class State:
         stake: float,
         deck: list[Card],
         verbose: bool = False,
+        chip_unit: float = 0.01,
+        stakes: Optional[list[float]] = None,
     ) -> State: ...
     def apply_action(self, action: Action) -> State: ...
     def __str__(self) -> str: ...
@@ -59,6 +72,7 @@ class StateStatus(Enum):
     IllegalAction = 1
     LowBet = 2
     HighBet = 3
+    InvalidAmount = 4
 
     def __int__(self): ...
 
@@ -80,7 +94,7 @@ class ActionEnum(Enum):
 
 class Action:
     action: ActionEnum
-    amount: int
+    amount: float
     def __new__(cls, action: ActionEnum, amount: float = 0) -> None: ...
 
 # card.rs ---------------------------------------------------------------------
@@ -90,7 +104,8 @@ class Card:
     rank: CardRank
     @staticmethod
     def from_string(string: str) -> Card | None: ...
-    def collect(self) -> list[Card]: ...
+    @staticmethod
+    def collect() -> list[Card]: ...
 
 class CardSuit(Enum):
     Clubs = 0

@@ -9,7 +9,9 @@ def test_game_logic_against_pluribus_logs():
     for i, pb_hand in enumerate(pluribus_data):
         n_players = len(pb_hand["players"])
         button = pb_hand["button"]
-        str_deck = [c for hand in pb_hand["private_cards"] for c in hand]
+        str_deck = [
+            hand[round_] for round_ in range(2) for hand in pb_hand["private_cards"]
+        ]
         if "public_cards" in pb_hand:
             if "flop" in pb_hand["public_cards"]:
                 str_deck += pb_hand["public_cards"]["flop"]
@@ -23,35 +25,52 @@ def test_game_logic_against_pluribus_logs():
             assert c is not None
             deck.append(c)
 
+        deck += [
+            c
+            for c in pkrs.Card.collect()
+            if not any(
+                int(c.rank) == int(d.rank) and int(c.suit) == int(d.suit) for d in deck
+            )
+        ]
+
         pkrs_state = pkrs.State.from_deck(
             n_players=n_players,
             button=button,
             deck=deck,
             sb=50,
             bb=100,
-            stake=float("inf"),
+            stake=10_000,
+            chip_unit=0.5,
         )
-        print(f"|{i}> game: {pb_hand['game']}, index: {pb_hand['index']}")
-        print(pkrs.visualize_trace([pkrs_state]))
         prev_state_final = False
         for pb_stage, pb_actions in pb_hand["actions"].items():
             for pb_action in pb_actions:
-                print(pb_action)
                 assert not prev_state_final
-                assert pkrs_state.status == pkrs.StateStatus.Ok
+                assert pkrs_state.status == pkrs.StateStatus.Ok, (
+                    i,
+                    pb_hand["game"],
+                    pb_hand["index"],
+                    pkrs_state.from_action,
+                    pkrs_state.min_bet,
+                    pkrs_state.min_raise,
+                )
                 assert pkrs_state.stage == pkrs.Stage.__dict__[pb_stage.capitalize()]
                 assert pkrs_state.current_player == pb_action["player"]
                 amount = pb_action.get("amount", 0)
-                action = pkrs.Action(
-                    pkrs.ActionEnum.__dict__[pb_action["action"].capitalize()], amount
-                )
+                if (
+                    pb_action["action"] == "call"
+                    and pkrs.ActionEnum.Check in pkrs_state.legal_actions
+                ):
+                    action_enum = pkrs.ActionEnum.Check
+                else:
+                    action_enum = pkrs.ActionEnum.__dict__[
+                        pb_action["action"].capitalize()
+                    ]
+                action = pkrs.Action(action_enum, amount)
                 prev_state_final = pkrs_state.final_state
                 pkrs_state = pkrs_state.apply_action(action)
-                print(pkrs.visualize_state(pkrs_state))
 
         assert pkrs_state.final_state
-        print("Pkrs rewards:", [ps.reward for ps in pkrs_state.players_state])
-        print("Real rewards:", pb_hand["rewards"])
         for p, r in enumerate(pb_hand["rewards"]):
             assert pkrs_state.players_state[p].reward == r
 
@@ -63,17 +82,25 @@ def test_initial_state():
                 n_players=n_players, button=button, sb=0.5, bb=1.0, stake=100, seed=1234
             )
             assert state.status == pkrs.StateStatus.Ok
-            assert state.current_player == (button + 3) % n_players
+            assert state.current_player == (
+                button if n_players == 2 else (button + 3) % n_players
+            )
             assert state.pot == 1.5
             assert state.min_bet == 1.0
 
             for ps in state.players_state:
                 assert ps.pot_chips == 0
                 assert ps.active
-                if ps.player == (button + 1) % n_players:
+                if ps.player == (
+                    button if n_players == 2 else (button + 1) % n_players
+                ):
                     assert ps.bet_chips == 0.5
                     assert ps.stake == 99.5
-                elif ps.player == (button + 2) % n_players:
+                elif ps.player == (
+                    (button + 1) % n_players
+                    if n_players == 2
+                    else (button + 2) % n_players
+                ):
                     assert ps.bet_chips == 1.0
                     assert ps.stake == 99
                 else:
@@ -112,3 +139,19 @@ def test_forced_checkdown_runs_out_to_showdown():
     assert state.status == pkrs.StateStatus.Ok
     assert state.legal_actions == []
     assert abs(sum(ps.reward for ps in state.players_state)) < 1e-9
+
+
+def test_raise_is_not_legal_when_call_uses_entire_stack():
+    state = pkrs.State.from_seed(
+        n_players=3, button=0, sb=1.0, bb=2.0, stake=4.0, seed=0
+    )
+
+    state = state.apply_action(pkrs.Action(pkrs.ActionEnum.Raise, amount=2.0))
+    state = state.apply_action(pkrs.Action(pkrs.ActionEnum.Call))
+
+    current_player = state.players_state[state.current_player]
+    call_amount = state.min_bet - current_player.bet_chips
+
+    assert call_amount == current_player.stake
+    assert pkrs.ActionEnum.Call in state.legal_actions
+    assert pkrs.ActionEnum.Raise not in state.legal_actions
